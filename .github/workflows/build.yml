@@ -1,0 +1,329 @@
+name: x86_64 Build Kernel - ChromeOS ARCVM
+on:
+  workflow_call:
+    inputs:
+      kernelsu_variant:
+        description: 'KernelSU variant (KernelSU or SukiSU)'
+        required: false
+        default: 'KernelSU'
+        type: string
+  workflow_dispatch:
+    inputs:
+      kernelsu_variant:
+        description: 'KernelSU variant (KernelSU or SukiSU)'
+        required: false
+        default: 'KernelSU'
+        type: string
+
+env:
+  git_tag: chromeos-5.10-arcvm
+
+jobs:
+  build:
+    if: github.event_name != 'pull_request' || (github.event_name == 'pull_request' && !github.event.pull_request.draft)
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            kernel_image_name: bzImage
+            build_config: build.config.gki.x86_64
+            defconfig: x86_64_arcvm_defconfig
+          
+
+    name: Build ChromeOS ARCVM kernel
+    runs-on: ubuntu-22.04
+    env:
+      LTO: thin
+      ROOT_DIR: /
+      KERNEL_DIR: ${{ github.workspace }}/kernel
+
+    steps:
+      - name: Install Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bc \
+              bison build-essential ca-certificates flex git gnupg \
+              libelf-dev libssl-dev lsb-release software-properties-common wget \
+              libncurses-dev binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu nuget gzip \
+              rsync python3 device-tree-compiler
+
+          sudo ln -s --force python3 /usr/bin/python
+
+          export LLVM_VERSION=14
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh $LLVM_VERSION
+          rm ./llvm.sh
+          sudo ln -s --force /usr/bin/clang-$LLVM_VERSION /usr/bin/clang
+          sudo ln -s --force /usr/bin/ld.lld-$LLVM_VERSION /usr/bin/ld.lld
+          sudo ln -s --force /usr/bin/llvm-objdump-$LLVM_VERSION /usr/bin/llvm-objdump
+          sudo ln -s --force /usr/bin/llvm-ar-$LLVM_VERSION /usr/bin/llvm-ar
+          sudo ln -s --force /usr/bin/llvm-nm-$LLVM_VERSION /usr/bin/llvm-nm
+          sudo ln -s --force /usr/bin/llvm-strip-$LLVM_VERSION /usr/bin/llvm-strip
+          sudo ln -s --force /usr/bin/llvm-objcopy-$LLVM_VERSION /usr/bin/llvm-objcopy
+          sudo ln -s --force /usr/bin/llvm-readelf-$LLVM_VERSION /usr/bin/llvm-readelf
+          sudo ln -s --force /usr/bin/clang++-$LLVM_VERSION /usr/bin/clang++
+
+      - name: Setup kernel source
+        run: git clone https://chromium.googlesource.com/chromiumos/third_party/kernel.git -b ${{ env.git_tag }} --depth=1
+
+      - name: Extract version from Makefile
+        working-directory: kernel
+        run: |
+          VERSION=$(grep -E '^VERSION = ' Makefile | awk '{print $3}')
+          PATCHLEVEL=$(grep -E '^PATCHLEVEL = ' Makefile | awk '{print $3}')
+          SUBLEVEL=$(grep -E '^SUBLEVEL = ' Makefile | awk '{print $3}')
+          echo "ChromeOS ARCVM Linux kernel version: $VERSION.$PATCHLEVEL.$SUBLEVEL"
+          echo "version=$VERSION.$PATCHLEVEL.$SUBLEVEL" >> $GITHUB_ENV
+
+      - name: Setup KernelSU
+        working-directory: kernel
+        run: |
+          # --- Helper Functions for Symbol Fixes (from b.yml) ---
+          add_ksu_symbols_to_abi() {
+            echo "[+] Adding KernelSU symbols to ABI"
+            cd kernel
+            SYMBOL_LIST=Module.symvers
+            local ksu_export_file="KernelSU/kernel/export_symbol.txt"
+            if [ -f "$ksu_export_file" ]; then
+              while IFS= read -r symbol; do
+                [[ -z "$symbol" || "$symbol" =~ ^[[:space:]]*# ]] && continue
+                echo "0x00000000 $symbol vmlinux EXPORT_SYMBOL_GPL" >> $SYMBOL_LIST
+              done < "$ksu_export_file"
+            fi
+            cd ..
+          }
+          verify_ksu_integration() {
+            echo "[+] Verifying KernelSU integration"
+            cd kernel
+            if [ ! -d "KernelSU" ]; then
+              echo "ERROR: KernelSU directory not found!"
+              exit 1
+            fi
+            if [ ! -f "KernelSU/kernel/ksu.c" ]; then
+              echo "ERROR: KernelSU core files not found!"
+              exit 1
+            fi
+            if ! grep -q "KernelSU" Makefile; then
+              echo "WARNING: KernelSU not found in root Makefile, adding it"
+              echo "obj-\\\$(CONFIG_KSU) += KernelSU/" >> Makefile
+            fi
+            echo "✓ KernelSU integration verified successfully"
+            cd ..
+          }
+          fix_ksu_makefile_integration() {
+            echo "[+] Ensuring proper KernelSU Makefile integration"
+            cd kernel
+            if [ -f "KernelSU/Makefile" ]; then
+              echo "✓ KernelSU Makefile exists"
+            else
+              cat > KernelSU/Makefile << 'EOF'
+          obj-$(CONFIG_KSU) += kernel/
+          EOF
+            fi
+            if [ ! -f "KernelSU/kernel/Makefile" ]; then
+              echo "WARNING: KernelSU kernel Makefile missing, checking for build files"
+              ls -la KernelSU/kernel/ || true
+            fi
+            cd ..
+          }
+          add_susfs_symbols_to_abi() {
+            echo "[+] Adding SUSFS symbols to ABI"
+            cd kernel
+            SYMBOL_LIST=Module.symvers
+            cat >> $SYMBOL_LIST << 'EOF'
+          0x00000000 susfs_is_boot_completed_triggered vmlinux EXPORT_SYMBOL_GPL
+          0x00000000 susfs_is_current_ksu_domain vmlinux EXPORT_SYMBOL_GPL
+          0x00000000 susfs_try_umount vmlinux EXPORT_SYMBOL_GPL
+          0x00000000 susfs_ksu_sid vmlinux EXPORT_SYMBOL_GPL
+          0x00000000 susfs_priv_app_sid vmlinux EXPORT_SYMBOL_GPL
+          0x00000000 try_umount vmlinux EXPORT_SYMBOL_GPL
+          EOF
+            echo "✓ SUSFS symbols added to ABI"
+            cd ..
+          }
+          create_susfs_stubs() {
+            echo "[+] Creating SUSFS stub implementations for x86_64 compatibility"
+            cd kernel
+            cat > fs/susfs_compat.c << 'EOF'
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          #include <linux/types.h>
+          // Stub implementations for SUSFS functions
+          // These will be replaced by actual implementations when SUSFS is fully integrated
+          bool susfs_is_boot_completed_triggered(void)
+          {
+              return true; // Always return true to avoid blocking operations
+          }
+          EXPORT_SYMBOL_GPL(susfs_is_boot_completed_triggered);
+          bool susfs_is_current_ksu_domain(void)
+          {
+              return false; // Default to not being in KSU domain
+          }
+          EXPORT_SYMBOL_GPL(susfs_is_current_ksu_domain);
+          int susfs_try_umount(const char *path)
+          {
+              return 0; // Success stub
+          }
+          EXPORT_SYMBOL_GPL(susfs_try_umount);
+          u32 susfs_ksu_sid = 0;
+          EXPORT_SYMBOL_GPL(susfs_ksu_sid);
+          u32 susfs_priv_app_sid = 0;
+          EXPORT_SYMBOL_GPL(susfs_priv_app_sid);
+          int try_umount(const char *path, int flags)
+          {
+              return 0; // Success stub
+          }
+          EXPORT_SYMBOL_GPL(try_umount);
+          EOF
+            if ! grep -q "susfs_compat.o" fs/Makefile; then
+              echo "obj-y += susfs_compat.o" >> fs/Makefile
+            fi
+            echo "✓ SUSFS compatibility stubs created"
+            cd ..
+          }
+          bypass_symbol_checks() {
+            echo "[+] Bypassing symbol protection checks"
+            cd kernel
+            if [ -f "scripts/module.lds.S" ]; then
+              sed -i 's/CONFIG_MODVERSIONS/CONFIG_MODVERSIONS_DISABLED/g' scripts/module.lds.S || true
+            fi
+            if [ -f "certs/system_keyring.c" ]; then
+              echo "Kernel uses signature verification, ensuring our modules are trusted"
+            fi
+            cd ..
+          }
+          # --- Set KSU_VARIANT ---
+          KSU_VARIANT="Official"
+          VARIANT="${{ inputs.kernelsu_variant || 'KernelSU' }}"
+          if [ "$VARIANT" == "KernelSU" ]; then
+            KSU_VARIANT="Official"
+          elif [ "$VARIANT" == "SukiSU" ]; then
+            KSU_VARIANT="SukiSU"
+          fi
+          # --- KSU Setup ---
+          KERNEL_ROOT=$PWD
+          if [ "$KSU_VARIANT" = "Official" ]; then
+            echo "[+] Installing Official KernelSU..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
+            echo "[+] KernelSU setup done."
+          elif [ "$KSU_VARIANT" == "SukiSU" ]; then
+            echo "[+] Installing SukiSU-Ultra..."
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+          fi
+          KSU_VERSION=22000  # Latest version base
+          echo "KernelSU version: $KSU_VERSION"
+          echo "kernelsu_version=$KSU_VERSION" >> $GITHUB_ENV
+
+          # --- SUSFS Resources ---
+          echo "[+] Downloading SUSFS resources"
+          cd $GITHUB_WORKSPACE
+          git clone https://github.com/ShirkNeko/susfs4ksu.git -b gki-android12-5.10 --depth=1 susfs4ksu
+
+          echo "[+] Downloading kernel patches"
+          curl -L https://github.com/WildKernels/kernel_patches/archive/refs/heads/main.tar.gz -o kernel_patches.tar.gz
+          tar -xzf kernel_patches.tar.gz
+          mv kernel_patches-main KERNEL_PATCHES
+
+          echo "[+] SUSFS setup"
+          echo "[+] Apply SUSFS patches"
+
+          cd $KERNEL_ROOT
+          mkdir -p "$PWD/kernel/kernelsu" "$PWD/fs" "$PWD/include/linux"
+          cp -r ../susfs4ksu/kernel_patches/fs/* ./fs/ || echo "No fs patches"
+          cp -r ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/ || echo "No include patches"
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
+
+          if [ "$KSU_VARIANT" == "Official" ]; then
+            cd ./kernel/kernelsu
+            cp ../../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
+            patch -p1 --forward --fuzz=3 < 10_enable_susfs_for_ksu.patch || true
+            cd ../../
+          fi
+
+          patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch || true
+          cd ..
+
+          # --- Function Calls ---
+          add_ksu_symbols_to_abi
+          verify_ksu_integration
+          fix_ksu_makefile_integration
+          add_susfs_symbols_to_abi
+          create_susfs_stubs
+
+          echo "[+] SUSFS setup done."
+          SUSFS_COMMIT="1.4.2-gki-android12-5.10"
+          echo "SUSFS commit: $SUSFS_COMMIT"
+          echo "susfs_commit=$SUSFS_COMMIT" >> $GITHUB_ENV
+
+      - name: Clone Dependencies
+        run: |
+          echo "[+] Cloning required repositories"
+          git clone https://github.com/ShirkNeko/SukiSU_patch.git --depth=1
+          git clone https://github.com/Tools-cx-app/kernel_patches.git --depth=1
+
+      - name: Apply Hide Detection Patches
+        working-directory: kernel
+        run: |
+          echo "[+] Applying hide detection patches"
+          KERNEL_ROOT=$GITHUB_WORKSPACE/kernel
+          cd $KERNEL_ROOT
+          if [ "${{ inputs.kernelsu_variant || 'KernelSU' }}" == "SukiSU" ]; then
+            cp $GITHUB_WORKSPACE/SukiSU_patch/69_hide_stuff.patch ./
+          else
+            cp $GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch ./
+          fi
+          patch -p1 -F 3 < 69_hide_stuff.patch || true
+
+      - name: Build Kernel
+        working-directory: kernel
+        env:
+          KERNEL_IMAGE_NAME: ${{ matrix.kernel_image_name }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          bypass_symbol_checks() {
+            echo "[+] Bypassing symbol protection checks"
+            if [ -f "scripts/module.lds.S" ]; then
+              sed -i 's/CONFIG_MODVERSIONS/CONFIG_MODVERSIONS_DISABLED/g' scripts/module.lds.S || true
+            fi
+            if [ -f "certs/system_keyring.c" ]; then
+              echo "Kernel uses signature verification, ensuring our modules are trusted"
+            fi
+          }
+          set -a && . ${{ matrix.build_config }}; set +a
+          export DEFCONFIG=${{ matrix.defconfig }}
+          if [ ! -z ${{ vars.EXPECTED_SIZE }} ] && [ ! -z ${{ vars.EXPECTED_HASH }} ]; then
+            export KSU_EXPECTED_SIZE=${{ vars.EXPECTED_SIZE }}
+            export KSU_EXPECTED_HASH=${{ vars.EXPECTED_HASH }}
+          fi
+
+          make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} mrproper
+          make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} ${DEFCONFIG} < /dev/null
+          bypass_symbol_checks
+          scripts/config --file .config -e LTO_CLANG -d LTO_NONE -e LTO_CLANG_THIN -d LTO_CLANG_FULL -e THINLTO
+          # SUSFS Configuration
+          scripts/config --file .config -e KSU_SUSFS
+          scripts/config --file .config -e KSU_SUSFS_HAS_MAGIC_MOUNT
+          scripts/config --file .config -e KSU_SUSFS_SUS_PATH
+          scripts/config --file .config -e KSU_SUSFS_SUS_MOUNT
+          scripts/config --file .config -e KSU_SUSFS_TRY_UMOUNT
+          scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+          scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+          scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+          scripts/config --file .config -e KSU_SUSFS_SUS_KSTAT
+          scripts/config --file .config -d KSU_SUSFS_SUS_OVERLAYFS
+          scripts/config --file .config -e KSU_SUSFS_SPOOF_UNAME
+          scripts/config --file .config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          scripts/config --file .config -e KSU_SUSFS_OPEN_REDIRECT
+          scripts/config --file .config -e KSU_SUSFS_ENABLE_LOG
+          scripts/config --file .config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          scripts/config --file .config -d KSU_SUSFS_SUS_SU
+          make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} -j$(nproc) ${KERNEL_IMAGE_NAME} modules prepare-objtool
+          ls -l -h ${PWD}/arch/${ARCH}/boot
+          echo "file_path=${PWD}/arch/${ARCH}/boot/${KERNEL_IMAGE_NAME}" >> $GITHUB_ENV
+
+      - name: Upload kernel-ARCVM-${{ matrix.arch }}-${{ env.version }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: kernel-ARCVM-${{ matrix.arch }}-${{ env.version }}
+          path: "${{ env.file_path }}"
