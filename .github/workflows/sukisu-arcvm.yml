@@ -5,7 +5,7 @@ on:
 jobs:
   build:
     name: Build ChromeOS ARCVM Kernel
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     env:
       KERNEL_BRANCH: chromeos-5.10-arcvm
@@ -27,14 +27,17 @@ jobs:
           libncurses-dev binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu nuget gzip \
           rsync python3 device-tree-compiler
 
+        # Make python3 default
         sudo ln -sf /usr/bin/python3 /usr/bin/python
 
+        # Install LLVM 14
         LLVM_VERSION=14
         wget https://apt.llvm.org/llvm.sh
         chmod +x llvm.sh
         sudo ./llvm.sh $LLVM_VERSION
         rm llvm.sh
 
+        # Symlink LLVM binaries to /usr/bin
         for bin in clang clang++ ld.lld llvm-ar llvm-nm llvm-strip llvm-objcopy llvm-objdump llvm-readelf; do
           sudo ln -sf /usr/bin/${bin}-${LLVM_VERSION} /usr/bin/$bin
         done
@@ -81,21 +84,27 @@ jobs:
         patch -p1 < kernel/susfs/kernel_patches/50_add_susfs_in_gki-android14-5.10.patch || true
 
     # ---------------------------------------------------------
-    # 🔨 BUILD KERNEL (Clang/LLVM + KernelSU + SUSFS)
+    # 🧩 CONFIGURE DEFCONFIG (x86_64)
     # ---------------------------------------------------------
-    - name: Build Kernel
-      working-directory: kernel
-      env:
-        KERNEL_IMAGE_NAME: ${{ matrix.kernel_image_name }}
-        ARCH: ${{ matrix.arch }}
+    - name: Update x86_64 kernel config
       run: |
-        set -a && . ${{ matrix.build_config }}; set +a
-        export DEFCONFIG=${{ matrix.defconfig }}
+        DEFCONFIG=kernel/arch/x86/configs/defconfig
+        echo "CONFIG_KSU=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_MANUAL_HOOK=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> $DEFCONFIG
+        echo "CONFIG_OVERLAY_FS=y" >> $DEFCONFIG
+        echo "CONFIG_ZRAM=y" >> $DEFCONFIG
+        echo "CONFIG_CRYPTO_LZ4=y" >> $DEFCONFIG
 
-        if [ ! -z ${{ vars.EXPECTED_SIZE }} ] && [ ! -z ${{ vars.EXPECTED_HASH }} ]; then
-          export KSU_EXPECTED_SIZE=${{ vars.EXPECTED_SIZE }}
-          export KSU_EXPECTED_HASH=${{ vars.EXPECTED_HASH }}
-        fi
+    # ---------------------------------------------------------
+    # 🔨 BUILD KERNEL (Clang/LLVM)
+    # ---------------------------------------------------------
+    - name: Build ChromeOS ARCVM Kernel (bzImage)
+      run: |
+        cd kernel
 
         export CC="ccache clang"
         export HOSTCC="clang"
@@ -107,45 +116,10 @@ jobs:
         export OBJCOPY=llvm-objcopy
         export OBJDUMP=llvm-objdump
 
-        echo "[+] Running mrproper"
-        make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} mrproper
-        
-        echo "[+] Loading defconfig: ${DEFCONFIG}"
-        make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} ${DEFCONFIG} < /dev/null
-        
-        echo "[+] Configuring LTO"
-        scripts/config --file .config -e LTO_CLANG -d LTO_NONE -e LTO_CLANG_THIN -d LTO_CLANG_FULL -e THINLTO
-        
-        echo "[+] Configuring KernelSU"
-        scripts/config --file .config -e KSU
-        scripts/config --file .config -e KALLSYMS
-        scripts/config --file .config -e KALLSYMS_ALL
-        
-        echo "[+] Configuring SUSFS"
-        scripts/config --file .config -e KSU_SUSFS
-        scripts/config --file .config -e KSU_SUSFS_HAS_MAGIC_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_SUS_PATH
-        scripts/config --file .config -e KSU_SUSFS_SUS_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_TRY_UMOUNT
-        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_SUS_KSTAT
-        scripts/config --file .config -d KSU_SUSFS_SUS_OVERLAYFS
-        scripts/config --file .config -e KSU_SUSFS_SPOOF_UNAME
-        scripts/config --file .config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-        scripts/config --file .config -e KSU_SUSFS_OPEN_REDIRECT
-        scripts/config --file .config -e KSU_SUSFS_ENABLE_LOG
-        scripts/config --file .config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-        scripts/config --file .config -d KSU_SUSFS_SUS_SU
-        
-        echo "[+] Starting kernel build with $(nproc) threads"
-        echo "[+] Building: ${KERNEL_IMAGE_NAME}, modules, and prepare-objtool"
-        make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} -j$(nproc) ${KERNEL_IMAGE_NAME} modules prepare-objtool
-        
-        echo "✓ Build complete!"
-        ls -lh ${PWD}/arch/${ARCH}/boot/${KERNEL_IMAGE_NAME}
-        echo "file_path=${PWD}/arch/${ARCH}/boot/${KERNEL_IMAGE_NAME}" >> $GITHUB_ENV
+        make defconfig ARCH=x86_64
+        make -j$(nproc) ARCH=x86_64 LLVM=1 bzImage
+
+        echo "Build finished."
 
     # ---------------------------------------------------------
     # 📦 PACKAGE bzImage
