@@ -5,7 +5,7 @@ on:
 jobs:
   build:
     name: Build ChromeOS ARCVM Kernel
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     env:
       KERNEL_BRANCH: chromeos-5.10-arcvm
