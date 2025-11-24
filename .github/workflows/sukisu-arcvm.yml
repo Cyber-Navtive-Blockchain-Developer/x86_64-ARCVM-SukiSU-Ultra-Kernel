@@ -1,71 +1,27 @@
-name: Build ARCVM Kernel – SukiSU Ultra + SUSFS
+name: Chained ARCVM Kernel Build
+
 on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build ChromeOS ARCVM Kernel
+  setup-and-patch:
+    name: Setup & Patch Kernel
     runs-on: ubuntu-latest
 
-    env:
-      KERNEL_BRANCH: chromeos-5.10-arcvm
-      KERNEL_REPO: https://chromium.googlesource.com/chromiumos/third_party/kernel
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      LLVM: 1
-      ARCH: x86_64
-
     steps:
-    # ---------------------------------------------------------
-    # 📦 SYSTEM PREP + LLVM
-    # ---------------------------------------------------------
-    - name: Install Dependencies & LLVM
+    - name: Checkout workflow repo
+      uses: actions/checkout@v3
+
+    - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          bc bison build-essential ca-certificates flex git gnupg \
-          libelf-dev libssl-dev lsb-release software-properties-common wget \
-          libncurses-dev binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu nuget gzip \
-          rsync python3 device-tree-compiler
+        sudo apt-get install -y git curl rsync
 
-        # Make python3 default
-        sudo ln -sf /usr/bin/python3 /usr/bin/python
-
-        # Install LLVM 14
-        LLVM_VERSION=14
-        wget https://apt.llvm.org/llvm.sh
-        chmod +x llvm.sh
-        sudo ./llvm.sh $LLVM_VERSION
-        rm llvm.sh
-
-        # Symlink LLVM binaries to /usr/bin
-        for bin in clang clang++ ld.lld llvm-ar llvm-nm llvm-strip llvm-objcopy llvm-objdump llvm-readelf; do
-          sudo ln -sf /usr/bin/${bin}-${LLVM_VERSION} /usr/bin/$bin
-        done
-
-    - name: Setup ccache
-      run: |
-        mkdir -p $CCACHE_DIR
-        ccache -M 10G
-        echo "Using ccache at $CCACHE_DIR"
-
-    - name: Restore ccache
-      uses: actions/cache@v3
-      with:
-        path: ${{ env.CCACHE_DIR }}
-        key: arcvm-ccache-${{ github.sha }}
-        restore-keys: arcvm-ccache-
-
-    # ---------------------------------------------------------
-    # 📥 FETCH KERNEL SOURCE
-    # ---------------------------------------------------------
     - name: Clone ChromeOS ARCVM Kernel
       run: |
-        git clone $KERNEL_REPO --branch $KERNEL_BRANCH --depth=1 kernel
-        echo "Kernel cloned."
+        git clone https://chromium.googlesource.com/chromiumos/third_party/kernel \
+          --branch chromeos-5.10-arcvm --depth=1 kernel
 
-    # ---------------------------------------------------------
-    # ⚙️ APPLY KernelSU + SukiSU Ultra + SUSFS
-    # ---------------------------------------------------------
     - name: Apply KernelSU
       run: |
         git clone https://github.com/tiann/KernelSU.git -b main kernel/ksu
@@ -83,29 +39,57 @@ jobs:
         cp -r kernel/susfs/kernel_patches/include/linux/* kernel/include/linux/
         patch -p1 < kernel/susfs/kernel_patches/50_add_susfs_in_gki-android14-5.10.patch || true
 
-    # ---------------------------------------------------------
-    # 🧩 CONFIGURE DEFCONFIG (x86_64)
-    # ---------------------------------------------------------
-    - name: Update x86_64 kernel config
-      run: |
-        DEFCONFIG=kernel/arch/x86/configs/defconfig
-        echo "CONFIG_KSU=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_MANUAL_HOOK=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> $DEFCONFIG
-        echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> $DEFCONFIG
-        echo "CONFIG_OVERLAY_FS=y" >> $DEFCONFIG
-        echo "CONFIG_ZRAM=y" >> $DEFCONFIG
-        echo "CONFIG_CRYPTO_LZ4=y" >> $DEFCONFIG
+    - name: Package Patched Kernel
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-patched
+        path: kernel
+        
 
-    # ---------------------------------------------------------
-    # 🔨 BUILD KERNEL (Clang/LLVM)
-    # ---------------------------------------------------------
-    - name: Build ChromeOS ARCVM Kernel (bzImage)
+  build-bzimage:
+    name: Build bzImage
+    runs-on: ubuntu-22.04
+    needs: setup-and-patch
+
+    steps:
+    - name: Download Patched Kernel Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: kernel-patched
+        path: ./patched-kernel
+
+    - name: Install Build Tools & LLVM 14
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          bc bison build-essential ca-certificates flex git gnupg \
+          libelf-dev libssl-dev lsb-release software-properties-common wget \
+          libncurses-dev binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu nuget gzip \
+          rsync python3 device-tree-compiler ccache
+
+        sudo ln -sf /usr/bin/python3 /usr/bin/python
+
+        LLVM_VERSION=14
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh $LLVM_VERSION
+        rm llvm.sh
+
+        for bin in clang clang++ ld.lld llvm-ar llvm-nm llvm-strip llvm-objcopy llvm-objdump llvm-readelf; do
+          sudo ln -sf /usr/bin/${bin}-${LLVM_VERSION} /usr/bin/$bin
+        done
+
+    - name: Extract Patched Kernel
+      run: |
+        tar -C ./patched-kernel -cf ./kernel.tar.gz .
+        mkdir -p kernel
+        tar xzf ./patched-kernel/kernel.tar.gz -C kernel
+
+    - name: Configure & Build Kernel bzImage
       run: |
         cd kernel
 
+        # LLVM toolchain
         export CC="ccache clang"
         export HOSTCC="clang"
         export HOSTCXX="clang++"
@@ -116,22 +100,49 @@ jobs:
         export OBJCOPY=llvm-objcopy
         export OBJDUMP=llvm-objdump
 
-        make defconfig ARCH=x86_64
-        make -j$(nproc) ARCH=x86_64 LLVM=1 bzImage
+        DEFCONFIG=arch/x86/configs/defconfig
 
-        echo "Build finished."
+        echo "[+] Running mrproper"
+        make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} mrproper
 
-    # ---------------------------------------------------------
-    # 📦 PACKAGE bzImage
-    # ---------------------------------------------------------
-    - name: Package Output
-      run: |
-        mkdir -p output
-        cp kernel/arch/x86/boot/bzImage output/
-        echo "bzImage packaged."
+        echo "[+] Loading defconfig: ${DEFCONFIG}"
+        make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} ${DEFCONFIG} < /dev/null
 
-    - name: Upload Artifact
+        echo "[+] Configuring LTO"
+        scripts/config --file .config -e LTO_CLANG -d LTO_NONE -e LTO_CLANG_THIN -d LTO_CLANG_FULL -e THINLTO
+
+        echo "[+] Configuring KernelSU"
+        scripts/config --file .config -e KSU
+        scripts/config --file .config -e KALLSYMS
+        scripts/config --file .config -e KALLSYMS_ALL
+
+        echo "[+] Configuring SUSFS"
+        scripts/config --file .config -e KSU_SUSFS
+        scripts/config --file .config -e KSU_SUSFS_HAS_MAGIC_MOUNT
+        scripts/config --file .config -e KSU_SUSFS_SUS_PATH
+        scripts/config --file .config -e KSU_SUSFS_SUS_MOUNT
+        scripts/config --file .config -e KSU_SUSFS_TRY_UMOUNT
+        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+        scripts/config --file .config -e KSU_SUSFS_SUS_KSTAT
+        scripts/config --file .config -d KSU_SUSFS_SUS_OVERLAYFS
+        scripts/config --file .config -e KSU_SUSFS_SPOOF_UNAME
+        scripts/config --file .config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+        scripts/config --file .config -e KSU_SUSFS_OPEN_REDIRECT
+        scripts/config --file .config -e KSU_SUSFS_ENABLE_LOG
+        scripts/config --file .config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+        scripts/config --file .config -d KSU_SUSFS_SUS_SU
+
+        echo "[+] Starting kernel build with $(nproc) threads"
+        make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} -j$(nproc) bzImage modules prepare-objtool
+
+        echo "✓ Build complete!"
+        ls -lh ${PWD}/arch/x86/boot/bzImage
+        echo "file_path=${PWD}/arch/x86/boot/bzImage" >> $GITHUB_ENV
+
+    - name: Upload bzImage
       uses: actions/upload-artifact@v4
       with:
-        name: arcvm_sukisu_ultra_kernel
-        path: output/*
+        name: arcvm_bzimage
+        path: kernel/arch/x86/boot/bzImage
