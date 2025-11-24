@@ -7,6 +7,8 @@ jobs:
   setup-and-patch:
     name: Setup & Patch Kernel
     runs-on: ubuntu-latest
+    outputs:
+      kernel_tar: ${{ steps.package.outputs.kernel_tar }}
 
     steps:
     - name: Checkout workflow repo
@@ -17,34 +19,121 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y git curl rsync
 
+    - name: Clone Dependencies First
+      run: |
+        echo "[+] Cloning required repositories"
+        git clone https://github.com/Tools-cx-app/kernel_patches.git --depth=1
+        echo "✓ All dependencies cloned successfully"
+
     - name: Clone ChromeOS ARCVM Kernel
       run: |
         git clone https://chromium.googlesource.com/chromiumos/third_party/kernel \
           --branch chromeos-5.10-arcvm --depth=1 kernel
 
-    - name: Apply KernelSU
+    - name: Setup KernelSU
+      working-directory: kernel
       run: |
-        git clone https://github.com/tiann/KernelSU.git -b main kernel/ksu
-        bash kernel/ksu/kernel/setup.sh
+        echo "[+] KernelSU setup via setup.sh"
+        KERNEL_ROOT=$PWD
 
-    - name: Apply SukiSU Ultra
-      run: |
-        curl -LSs https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/susfs-main/kernel/setup.sh \
-          | bash -s susfs-main
+        if [ "${{ inputs.kernelsu_variant || 'KernelSU' }}" == "SukiSU" ]; then
+          echo "[+] Installing SukiSU variant"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+        else
+          echo "[+] Installing Official KernelSU v0.9.5"
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
+        fi
 
-    - name: Apply SUSFS (simonpunk)
+        echo "✓ KernelSU setup done."
+        echo "[+] Using KernelSU version: ${{ env.kernelsu_version }}"
+
+    - name: Add KernelSU symbols to ABI
+      working-directory: kernel
       run: |
-        git clone https://gitlab.com/simonpunk/susfs4ksu.git kernel/susfs
-        cp -r kernel/susfs/kernel_patches/fs/* kernel/fs/
-        cp -r kernel/susfs/kernel_patches/include/linux/* kernel/include/linux/
-        patch -p1 < kernel/susfs/kernel_patches/50_add_susfs_in_gki-android14-5.10.patch || true
+        echo "[+] Adding KernelSU symbols to ABI"
+        SYMBOL_LIST=Module.symvers
+        if [ -f "KernelSU/kernel/export_symbol.txt" ]; then
+          while IFS= read -r symbol; do
+            [[ -z "$symbol" || "$symbol" =~ ^[[:space:]]*# ]] && continue
+            symbol=$(echo "$symbol" | xargs)
+            echo "0x00000000	$symbol	vmlinux	EXPORT_SYMBOL_GPL" >> $SYMBOL_LIST
+          done < KernelSU/kernel/export_symbol.txt
+        fi
+        echo "✓ KernelSU symbols added: $(wc -l < $SYMBOL_LIST 2>/dev/null || echo '0') entries"
+
+    - name: Verify KernelSU integration
+      working-directory: kernel
+      run: |
+        echo "[+] Verifying KernelSU integration"
+        [ ! -d "KernelSU" ] && echo "ERROR: KernelSU directory not found!" && exit 1
+        [ ! -f "KernelSU/kernel/ksu.c" ] && echo "ERROR: KernelSU core files not found!" && exit 1
+        grep -q "KernelSU" Makefile || echo "obj-\$(CONFIG_KSU) += KernelSU/" >> Makefile
+        echo "✓ KernelSU integration verified"
+        ls -la KernelSU/
+
+    - name: Fix KernelSU Makefile for x86_64
+      working-directory: kernel
+      run: |
+        [ ! -f "KernelSU/Makefile" ] && echo "obj-$(CONFIG_KSU) += kernel/" > KernelSU/Makefile
+        [ ! -f "KernelSU/kernel/Makefile" ] && echo "WARNING: KernelSU kernel Makefile missing" && ls -la KernelSU/kernel/ || echo "✓ KernelSU kernel Makefile exists"
+
+    - name: Verify SUSFS Integration
+      working-directory: kernel
+      run: |
+        echo "[+] Verifying SUSFS integration"
+        [ -f "fs/susfs.c" ] && echo "✓ SUSFS core file exists" || echo "⚠ WARNING: fs/susfs.c not found"
+        [ -f "include/linux/susfs.h" ] && echo "✓ SUSFS header exists" || echo "⚠ WARNING: include/linux/susfs.h not found"
+        [ -f "fs/susfs_compat.c" ] && echo "✓ SUSFS compatibility stubs exist" || (echo "✗ ERROR: SUSFS compatibility stubs not found!" && exit 1)
+        if [ -f "KernelSU/kernel/Kconfig" ]; then
+          grep -q "KSU_SUSFS" KernelSU/kernel/Kconfig && echo "✓ SUSFS Kconfig found in KernelSU" || echo "⚠ SUSFS Kconfig not found in KernelSU"
+        fi
+        echo "[+] SUSFS-related files:"
+        find . -type f -name "*susfs*" 2>/dev/null | head -20
+
+    - name: Apply Hide Detection Patches
+      working-directory: kernel
+      run: |
+        echo "[+] Applying hide detection patches"
+        KERNEL_ROOT=$GITHUB_WORKSPACE/kernel
+        cd $KERNEL_ROOT
+        if [ "${{ inputs.kernelsu_variant || 'KernelSU' }}" == "SukiSU" ]; then
+          [ -f "$GITHUB_WORKSPACE/SukiSU_patch/69_hide_stuff.patch" ] && patch -p1 -F3 < $GITHUB_WORKSPACE/SukiSU_patch/69_hide_stuff.patch || echo "[-] SukiSU hide patch not found"
+        else
+          [ -f "$GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch" ] && patch -p1 -F3 < $GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch || echo "[-] KernelSU hide patch not found"
+        fi
+
+    - name: Bypass symbol protection checks
+      working-directory: kernel
+      run: |
+        echo "[+] Bypassing symbol protection for custom modules"
+        [ -f "scripts/module.lds.S" ] && sed -i 's/CONFIG_MODVERSIONS/CONFIG_MODVERSIONS_DISABLED/g' scripts/module.lds.S
+        echo "✓ Symbol protection bypass complete"
+
+    - name: Add SUSFS symbols to ABI
+      working-directory: kernel
+      run: |
+        SYMBOL_LIST=Module.symvers
+        cat >> $SYMBOL_LIST << 'EOF'
+0x00000000	susfs_is_boot_completed_triggered	vmlinux	EXPORT_SYMBOL_GPL
+0x00000000	susfs_is_current_ksu_domain	vmlinux	EXPORT_SYMBOL_GPL
+0x00000000	susfs_try_umount	vmlinux	EXPORT_SYMBOL_GPL
+0x00000000	susfs_ksu_sid	vmlinux	EXPORT_SYMBOL_GPL
+0x00000000	susfs_priv_app_sid	vmlinux	EXPORT_SYMBOL_GPL
+0x00000000	try_umount	vmlinux	EXPORT_SYMBOL_GPL
+EOF
+        echo "✓ SUSFS symbols added to ABI"
 
     - name: Package Patched Kernel
+      id: package
+      run: |
+        tar czf kernel-patched.tar.gz kernel
+        echo "kernel-patched.tar.gz" >> $GITHUB_OUTPUT
+
+    - name: Upload Patched Kernel
       uses: actions/upload-artifact@v4
       with:
         name: kernel-patched
-        path: kernel
-        
+        path: kernel-patched.tar.gz
 
   build-bzimage:
     name: Build bzImage
@@ -58,6 +147,11 @@ jobs:
         name: kernel-patched
         path: ./patched-kernel
 
+    - name: Extract Patched Kernel
+      run: |
+        mkdir -p kernel
+        tar xzf ./patched-kernel/kernel-patched.tar.gz -C kernel
+
     - name: Install Build Tools & LLVM 14
       run: |
         sudo apt-get update
@@ -66,30 +160,19 @@ jobs:
           libelf-dev libssl-dev lsb-release software-properties-common wget \
           libncurses-dev binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu nuget gzip \
           rsync python3 device-tree-compiler ccache
-
         sudo ln -sf /usr/bin/python3 /usr/bin/python
-
         LLVM_VERSION=14
         wget https://apt.llvm.org/llvm.sh
         chmod +x llvm.sh
         sudo ./llvm.sh $LLVM_VERSION
         rm llvm.sh
-
         for bin in clang clang++ ld.lld llvm-ar llvm-nm llvm-strip llvm-objcopy llvm-objdump llvm-readelf; do
           sudo ln -sf /usr/bin/${bin}-${LLVM_VERSION} /usr/bin/$bin
         done
 
-    - name: Extract Patched Kernel
-      run: |
-        tar -C ./patched-kernel -cf ./kernel.tar.gz .
-        mkdir -p kernel
-        tar xzf ./patched-kernel/kernel.tar.gz -C kernel
-
     - name: Configure & Build Kernel bzImage
       run: |
         cd kernel
-
-        # LLVM toolchain
         export CC="ccache clang"
         export HOSTCC="clang"
         export HOSTCXX="clang++"
@@ -101,40 +184,19 @@ jobs:
         export OBJDUMP=llvm-objdump
 
         DEFCONFIG=arch/x86/configs/defconfig
-
-        echo "[+] Running mrproper"
         make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} mrproper
-
-        echo "[+] Loading defconfig: ${DEFCONFIG}"
         make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} ${DEFCONFIG} < /dev/null
 
-        echo "[+] Configuring LTO"
         scripts/config --file .config -e LTO_CLANG -d LTO_NONE -e LTO_CLANG_THIN -d LTO_CLANG_FULL -e THINLTO
+        scripts/config --file .config -e KSU -e KALLSYMS -e KALLSYMS_ALL
+        scripts/config --file .config -e KSU_SUSFS -e KSU_SUSFS_HAS_MAGIC_MOUNT -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT
+        scripts/config --file .config -e KSU_SUSFS_TRY_UMOUNT -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+        scripts/config --file .config -e KSU_SUSFS_SUS_KSTAT -d KSU_SUSFS_SUS_OVERLAYFS
+        scripts/config --file .config -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+        scripts/config --file .config -e KSU_SUSFS_OPEN_REDIRECT -e KSU_SUSFS_ENABLE_LOG
+        scripts/config --file .config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS -d KSU_SUSFS_SUS_SU
 
-        echo "[+] Configuring KernelSU"
-        scripts/config --file .config -e KSU
-        scripts/config --file .config -e KALLSYMS
-        scripts/config --file .config -e KALLSYMS_ALL
-
-        echo "[+] Configuring SUSFS"
-        scripts/config --file .config -e KSU_SUSFS
-        scripts/config --file .config -e KSU_SUSFS_HAS_MAGIC_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_SUS_PATH
-        scripts/config --file .config -e KSU_SUSFS_SUS_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_TRY_UMOUNT
-        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
-        scripts/config --file .config -e KSU_SUSFS_SUS_KSTAT
-        scripts/config --file .config -d KSU_SUSFS_SUS_OVERLAYFS
-        scripts/config --file .config -e KSU_SUSFS_SPOOF_UNAME
-        scripts/config --file .config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
-        scripts/config --file .config -e KSU_SUSFS_OPEN_REDIRECT
-        scripts/config --file .config -e KSU_SUSFS_ENABLE_LOG
-        scripts/config --file .config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-        scripts/config --file .config -d KSU_SUSFS_SUS_SU
-
-        echo "[+] Starting kernel build with $(nproc) threads"
         make LLVM=1 LLVM_IAS=1 DEPMOD=depmod DTC=dtc O=${PWD} -j$(nproc) bzImage modules prepare-objtool
 
         echo "✓ Build complete!"
