@@ -1,0 +1,134 @@
+name: Build ARCVM Kernel – SukiSU Ultra + SUSFS
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ChromeOS ARCVM Kernel
+    runs-on: ubuntu-latest
+
+    env:
+      KERNEL_BRANCH: chromeos-5.10-arcvm
+      KERNEL_REPO: https://chromium.googlesource.com/chromiumos/third_party/kernel
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      LLVM: 1
+      ARCH: x86_64
+
+    steps:
+    # ---------------------------------------------------------
+    # 📦 SYSTEM PREP
+    # ---------------------------------------------------------
+    - name: Install Dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          git ccache libelf-dev build-essential flex bison libssl-dev \
+          libncurses-dev liblz4-tool zlib1g-dev dwarves bc binutils-dev \
+          python3 rsync curl xz-utils lz4
+
+    - name: Setup ccache
+      run: |
+        mkdir -p $CCACHE_DIR
+        ccache -M 10G
+        echo "Using ccache at $CCACHE_DIR"
+    - name: Restore ccache
+      uses: actions/cache@v3
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: arcvm-ccache-${{ github.sha }}
+        restore-keys: arcvm-ccache-
+
+    # ---------------------------------------------------------
+    # 📥 FETCH KERNEL SOURCE
+    # ---------------------------------------------------------
+    - name: Clone ChromeOS ARCVM Kernel
+      run: |
+        git clone $KERNEL_REPO --branch $KERNEL_BRANCH --depth=1 kernel
+        cd kernel
+        echo "Kernel cloned."
+
+    # ---------------------------------------------------------
+    # ⚙️ APPLY KernelSU + SukiSU Ultra + SUSFS
+    # ---------------------------------------------------------
+
+    - name: Apply KernelSU
+      run: |
+        cd kernel
+        git clone https://github.com/tiann/KernelSU.git -b main ksu
+        bash ksu/kernel/setup.sh
+
+    - name: Apply SukiSU Ultra
+      run: |
+        cd kernel
+        curl -LSs \
+          https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/susfs-main/kernel/setup.sh \
+          | bash -s susfs-main
+
+    - name: Apply SUSFS (simonpunk)
+      run: |
+        cd kernel
+        git clone https://gitlab.com/simonpunk/susfs4ksu.git susfs
+        cp -r susfs/kernel_patches/fs/* fs/
+        cp -r susfs/kernel_patches/include/linux/* include/linux/
+        echo "Applying SUSFS core patch..."
+        patch -p1 < susfs/kernel_patches/50_add_susfs_in_gki-android14-5.10.patch || true
+
+    # ---------------------------------------------------------
+    # 🧩 CONFIGURE DEFCONFIG (x86_64)
+    # ---------------------------------------------------------
+    - name: Update x86_64 kernel config
+      run: |
+        cd kernel
+
+        DEFCONFIG=arch/x86/configs/defconfig
+
+        echo "CONFIG_KSU=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_MANUAL_HOOK=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> $DEFCONFIG
+        echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> $DEFCONFIG
+        echo "CONFIG_OVERLAY_FS=y" >> $DEFCONFIG
+        echo "CONFIG_ZRAM=y" >> $DEFCONFIG
+        echo "CONFIG_CRYPTO_LZ4=y" >> $DEFCONFIG
+
+        echo "ARCVM defconfig updated."
+
+    # ---------------------------------------------------------
+    # 🔨 BUILD KERNEL (Clang/LLVM)
+    # ---------------------------------------------------------
+    - name: Build ChromeOS ARCVM Kernel (bzImage)
+      run: |
+        cd kernel
+
+        # LLVM toolchain (ChromeOS)
+        export PATH=$(pwd)/chromeos/prebuilts/clang/bin:$PATH
+        export CC="ccache clang"
+        export HOSTCC="clang"
+        export HOSTCXX="clang++"
+        export LD=ld.lld
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export STRIP=llvm-strip
+        export OBJCOPY=llvm-objcopy
+        export OBJDUMP=llvm-objdump
+
+        make defconfig ARCH=x86_64
+        make -j$(nproc --all) ARCH=x86_64 LLVM=1 bzImage
+
+        echo "Build finished."
+
+    # ---------------------------------------------------------
+    # 📦 PACKAGE bzImage
+    # ---------------------------------------------------------
+    - name: Package Output
+      run: |
+        mkdir output
+        cp kernel/arch/x86/boot/bzImage output/
+        echo "bzImage packaged."
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: arcvm_sukisu_ultra_kernel
+        path: output/*
